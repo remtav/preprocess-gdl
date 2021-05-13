@@ -4,14 +4,14 @@ import glob
 from pathlib import Path
 import os
 from datetime import datetime
-import warnings
-from typing import Union, List
+from typing import Union
 import logging
 
 from ruamel_yaml import YAML
 import rasterio
 
 logging.getLogger(__name__)
+
 
 class CsvLogger:
     def __init__(self, out_csv: str = None):
@@ -43,18 +43,18 @@ class CsvLogger:
         else:
             logging.warning("Csv output file not created.")
 
-    def write_row(self, row: List = []):
+    def write_row(self, info):
         """
         Write a row to self.
-        :param row: list
-            row to be added to the csv linked to self (self.out_csv)
+        :param info:
+            tile information to be added to the csv linked to self (self.out_csv)
         :return:
         """
         if self.out_csv:
             try:
                 of_connection = open(str(self.out_csv), 'a', newline="")  # Write to the csv file ('a' means append)
                 writer = csv.writer(of_connection, delimiter=';')
-                writer.writerow(row)
+                writer.writerow(info)
                 of_connection.close()
             except PermissionError as e:
                 logging.warning(e)
@@ -85,7 +85,7 @@ def str2bool(v):
     :return:
     """
     if isinstance(v, bool):
-       return v
+        return v
     if v.lower() in ('yes', 'true', 't', 'y', '1'):
         return True
     elif v.lower() in ('no', 'false', 'f', 'n', '0'):
@@ -105,19 +105,6 @@ def empty_folder(folder):
     for f in files:
         os.remove(f)
         logging.warning('Removing: %s' % f)
-
-
-def validate_raster(raster: Union[Path, str]):
-    # TODO: This would have been great if it worked. See: https://lists.osgeo.org/pipermail/gdal-dev/2013-November/037520.html
-    # Been having trouble with Gdal 2.2.2: not reading ntf.
-    # Also, version 2.4 is returning invalid ntf, although opens ok in QGIS.
-    # if Path(raster).is_file():
-    #     ds = gdal.Open(str(raster))
-    #     for i in range(ds.RasterCount):
-    #         ds.GetRasterBand(1).Checksum()
-    #         if gdal.GetLastErrorType() != 0:
-    #             return False
-    pass
 
 
 def valid_path_length(path: Union[Path, str]):
@@ -167,19 +154,3 @@ def rasterio_raster_reader(tif_file: str = ""):
     """
     raster = rasterio.open(str(tif_file), 'r')
     return raster
-
-
-def list_of_tuples_from_csv(path, delimiter=";"):
-    """
-    Create list of tuples from a csv file
-    :param path: Path or str
-        path to csv file
-    :param delimiter: str
-        type of delimiter for inputted csv
-    :return:
-    """
-    assert Path(path).suffix == '.csv', ('Not a ".csv.": ' + path)
-    with open(str(path), newline='') as f:
-        reader = csv.reader(f, delimiter=delimiter)
-        data = [tuple(row) for row in reader]
-    return data

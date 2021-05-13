@@ -1,44 +1,29 @@
-import os
 import argparse
-from _ast import List
+import glob
+import os
+import re
 from datetime import datetime
 from pathlib import Path
-from typing import Union
 
 from tqdm import tqdm
 
-from PansharpRaster import PansharpRaster
-from utils import list_of_tuples_from_csv, read_parameters, validate_file_exists, CsvLogger
-from preprocess_glob import pansharp_glob
+from PansharpRaster import gdal_split_band, pansharpen, rasterio_merge_tiles, gdal_8bit_rescale
+from preprocess_glob import tile_list_glob
+from utils import CsvLogger, read_parameters
 
 
-def main(input_csv: str = "",
-         method: str ="bayes",
-         trim: Union[int, List] = 0,
-         copy_to_8bit: bool = True,
+def main(method: str = "gdal-cubic",
          max_ram = 4096,
-         cog: bool = True,
-         cog_delete_source: bool = False,
          log_csv: str = "",
          overwrite: bool = False,
          glob_params: dict = None,
-         dry_run: bool = False):
+         dry_run: bool = False,
+         delete_intermediate_files: bool = False):
     """
     Preprocess rasters according to chosen parameters. This includes pansharpening,
-    rescaling with radiometric histogram trimming and cogging rasters.
-    #FIXME: trim function is not implemented other than for uint8 copies since only these copies are processed with the DynamicConvert app
-    :param input_csv: str
-        Csv from glob process, if glob was done as separate step.
+    rescaling to 8bit, merging tiles and splitting rasters into single band images.
     :param method: str
         Pansharp method. Choices: otb-lmvm, otb-bayes, simple_brovey, brovey, simple_mean, esri, hsv
-    :param trim: int or list
-        Quantiles to cut from histogram low/high values.
-    :param copy_to_8bit: bool
-        Create uint8 copy of all outputted pansharps and cogs if input's dtype is uint16
-    :param cog: bool
-        If True, coggify outputted pansharps (requires rio_cogeo)
-    :param cog_delete_source: bool
-        If True, non-cog pansharp will be deleted after cog pansharp is created and validated
     :param log_csv: str
         Name of csv where logging for individual rasters (ie one raster per row) will be recorded
     :param overwrite: bool
@@ -47,6 +32,8 @@ def main(input_csv: str = "",
         Parameters sent to preprocess_glob.pansharp_glob() function. See function for more details.
     :param dry_run: bool
         If True, script runs normally, except all time-consuming processes are skipped (i.e. no pansharp, no cogging)
+    :param delete_intermediate_files: bool
+        If True, will delete all intermediate files and only keep the singleband images.
     :return:
         Preprocessed rasters (pansharped/cogged), depending on inputted parameters and
         availability of modules (eg. otbApplication and rio_cogeo)
@@ -68,128 +55,101 @@ def main(input_csv: str = "",
 
     # 1. BUILD INPUT LIST
     ################################################################################
-    # if input csv specified, build input list from it, else use pansharp_glob() function and glob parameters
-    if input_csv:
-        pansharp_glob_list = list_of_tuples_from_csv(input_csv, delimiter=";")
-    else:
-        pansharp_glob_list = pansharp_glob(**glob_params, pansharp_method=method)
-
-    count = ct_missing_mul_pan = count_pshped = ct_psh_exist = 0
+    pansharp_glob_list = tile_list_glob(**glob_params)
 
     # 2. LOOP THROUGH INPUT LIST. Each item is a row with info about single image (multispectral/panchromatic, etc.)
     ################################################################################
-    for row in tqdm(pansharp_glob_list, desc='Iterating through mul/pan pairs list'):
+    for img_info in pansharp_glob_list:
+        logging.info(msg=f"Processing image {img_info.im_name} {pansharp_glob_list.index(img_info) + 1} / {len(pansharp_glob_list)}")
         now_read, duration = datetime.now(), 0
-        # Map each item of row to a intelligible variable
-        base_dir, mul_raster, pan_raster, dtype, output_psh, psh_method_csv, output_cog, *_ = [row[i] for i in range(len(row))]
-        # Create instance of PansharpRaster from these infos. To be completed during process.
-        PshRaster = PansharpRaster(basedir=Path(base_dir),
-                                   multispectral=Path(mul_raster),
-                                   panchromatic=Path(pan_raster),
-                                   pansharp=Path(output_psh),
-                                   cog=Path(output_cog),
-                                   dtype=dtype,
-                                   method=method,
-                                   trim=trim,
-                                   copy_to_8bit=copy_to_8bit,
-                                   cog_delete_source=cog_delete_source)
         os.chdir(base_dir)
-        logging.debug(f"Output pansharp: {output_psh}")
+        t = tqdm(total=4)
+        # Merge has to be done first. Otherwise it will create artefacts in other steps.
+        if 'merge' in img_info.process_steps:
+            p = re.compile('R\wC\w')
+            if 'psh' in img_info.process_steps:
+                out_mul_name = p.sub('Merge', str(img_info.mul_tile_list[0].stem)) + ".tif"
+                out_pan_name = p.sub('Merge', str(img_info.pan_tile_list[0].stem)) + ".tif"
+                out_mul_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(out_mul_name)
+                out_pan_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(out_pan_name)
 
-        # 3. PANSHARP!
-        ################################################################################
-        # TODO: standardize flow of pansharpen() and coggify(). Many validation steps are done internally for coggify(),
-        # like making sure output doens't exist, input exists, etc.
-        if not validate_file_exists(Path(output_cog)):
-            # If output not found, check if all inputs exist before processing, else skip (already exists).
-            if not validate_file_exists(Path(output_psh)) or overwrite:
-                # Double check if multispectral or panchromatic are not valid rasters, raise warning and skip.
-                if not validate_file_exists(PshRaster.multispectral) or not validate_file_exists(PshRaster.panchromatic):
-                    logging.warning('Missing info for mul %s or pan %s raster.',
-                                   PshRaster.multispectral, PshRaster.panchromatic)
-                    continue
-                else:  # Else: then pansharp does not exist and mul/pan files are valid --> PANSHARP!
-                    Path(output_psh).parent.mkdir(exist_ok=True)
-                    PshRaster.pansharpen(output_psh, ram=max_ram, dry_run=dry_run)
-            else:  # Else: pansharp exists.
-                logging.info(f"\nPansharp already exists: {output_psh}")
-                PshRaster.pansharp = Path(output_psh)
+                img_info.mul_merge, img_info.errors = rasterio_merge_tiles(tile_list=img_info.mul_tile_list, outfile=out_mul_merge,
+                                                                           overwrite=overwrite)
+                img_info.pan_merge, img_info.errors = rasterio_merge_tiles(tile_list=img_info.pan_tile_list, outfile=out_pan_merge,
+                                                                           overwrite=overwrite)
+            else:
+                out_psh_name = p.sub('Merge', str(img_info.psh_tile_list[0].stem)) + ".tif"
+                out_psh_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(out_psh_name)
+                img_info.psh_merge, img_info.errors = rasterio_merge_tiles(tile_list=img_info.psh_tile_list, outfile=out_psh_merge,
+                                                                           overwrite=overwrite)
         else:
-            logging.info(f"\nCogged pansharp already exists: {output_cog}")
-            PshRaster.cog = Path(output_cog)
-            PshRaster.cog_size = round(Path(output_cog).stat().st_size / 1024 ** 3, 2)
-
+            if 'psh' in img_info.process_steps:
+                img_info.mul_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(img_info.mul_tile_list[0])
+                img_info.pan_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(img_info.pan_tile_list[0])
+            else:
+                img_info.psh_merge = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path(img_info.psh_tile_list[0])
+        t.update()
+        # Pansharpening
+        if 'psh' in img_info.process_steps and not img_info.errors:
+            img_info.psh_merge, err = pansharpen(img_info=img_info, method=method, ram=max_ram, dry_run=dry_run, overwrite=overwrite)
+            img_info.errors = err if err != '[]' else None
+        t.update()
+        # Scale to 8 bit
+        if 'scale' in img_info.process_steps and not img_info.errors:
+            # then scale to uint8.
+            in_name = img_info.psh_merge.stem
+            if str(in_name).endswith(f"_{img_info.dtype}"):
+                outfile_name = Path(str(in_name).replace(f"_{img_info.dtype}", "_uint8.tif"))
+            else:
+                outfile_name = Path(f"{str(in_name)}_uint8.tif")
+            outfile = img_info.parent_folder / img_info.image_folder / img_info.prep_folder / outfile_name
+            err = gdal_8bit_rescale(infile=img_info.psh_merge, outfile=outfile, overwrite=overwrite)
+            img_info.errors = err if err else None
+            img_info.scale_img = outfile
+        else:
+            img_info.scale_img = img_info.psh_merge
+        t.update()
+        # Split into singleband images
+        if not img_info.errors:
+            if 'psh' in img_info.process_steps:
+                xml_f = img_info.parent_folder / img_info.image_folder / img_info.mul_xml
+            else:
+                xml_f = img_info.parent_folder / img_info.image_folder / img_info.psh_xml
+            img_info.band_file_list, img_info.errors = gdal_split_band(img_info.im_name, img_info.scale_img, xml_f)
+        t.update()
+        # # Delete intemerdiate files
+        # if delete_intermediate_files and not img_info.errors:
+        #     logging.warning('Will delete intermediate files.')
+        #     patern = str(img_info.parent_folder / img_info.image_folder / img_info.prep_folder / Path('*.tif'))
+        #     list_file_to_delete = [f for f in glob.glob(patern) if f not in img_info.band_file_list]
+        #     for file in list_file_to_delete:
+        #         try:
+        #             os.remove(file)
+        #         except OSError as e:
+        #             print("Error: %s : %s" % (file, e.strerror))
+        # t.update()
+        t.close()
         duration = (datetime.now() - now_read).seconds / 60
+        logging.info(f"Image {img_info.image_folder} processed in {duration} minutes")
 
-        # 4. COGGIFY!
-        if cog:
-            PshRaster.coggify(output_cog,
-                              dry_run=dry_run,
-                              overwrite=overwrite,
-                              delete_source=cog_delete_source)
+        row = [img_info.image_folder, img_info.errors, duration]
+        CsvLog.write_row(info=row)
 
-        # 5. UINT8 COPY, if requested and dtype is uint16
-        # set name for 8bit copy: replace "uint16" with "uint8" if possible, else add the latter as suffix.
-        if "uint16" in output_psh:
-            out_8bit = output_psh.replace("uint16", "uint8")
-        else:
-            out_8bit = str(Path(output_psh).parent / f"{Path(output_psh).stem}-uint8{Path(output_psh).suffix}")
+    list_16bit = [x for x in pansharp_glob_list if x.dtype == "uint16"]
+    list_8bit = [x for x in pansharp_glob_list if x.dtype == "uint8"]
 
-        if "uint16" in output_cog:
-            output_cog_8bit = output_cog.replace("uint16", "uint8")
-        else:
-            output_cog_8bit = str(Path(output_cog).parent / f"{Path(output_cog).stem}-uint8{Path(output_cog).suffix}")
-
-        # If cogged 8bit copy doesn't exist
-        if not validate_file_exists(output_cog_8bit):
-            # if 8bit is requested and pansharp is 16bit
-            if copy_to_8bit and PshRaster.dtype == "uint16":
-                # if output 8bit pansharp doesn't exist or overwrite requested, RESCALE!
-                if not validate_file_exists(out_8bit) or overwrite:
-                    PshRaster.rescale_trim(out_8bit, dry_run=dry_run)
-                else:
-                    PshRaster.pansharp_8bit_copy = Path(out_8bit)
-        else:
-            logging.info(f"\nCogged 8bit copy of pansharp already exists: {output_cog_8bit}")
-            PshRaster.cog_8bit_copy = Path(output_cog_8bit)
-
-        if cog:
-            PshRaster.coggify(out_file=output_cog_8bit,
-                              uint8_copy=True,
-                              dry_run=dry_run,
-                              overwrite=overwrite,
-                              delete_source=cog_delete_source)
-
-            duration = datetime.now() - now_read
-
-        # 5. Write metadata to CSV
-        ################################################################################
-        row = [PshRaster.multispectral, PshRaster.panchromatic, PshRaster.dtype, PshRaster.pansharp,
-               PshRaster.pansharp_8bit_copy, PshRaster.cog, PshRaster.cog_8bit_copy, PshRaster.cog_size,
-               now_read.strftime("%Y-%m-%d_%H-%M"), duration, PshRaster.errors]
-
-        CsvLog.write_row(row=row)
-
-    list_16bit = [x for x in PshRaster.all_objects if x.dtype == "uint16"]
-    list_8bit = [x for x in PshRaster.all_objects if x.dtype == "uint8"]
-
-    existing_pshps = [x for x in PshRaster.all_objects if x.pansharp]
-    existing_cogs = [x for x in PshRaster.all_objects if x.cog]
+    existing_pshps = [x for x in pansharp_glob_list if x.psh_tile_list]
+    non_tiled = [x for x in pansharp_glob_list if 'merge' not in x.process_steps]
 
     logging.info(
-        f"\nProcessed rasters: {len(PshRaster.all_objects)}"
-          f"\n\t16 bit: {len(list_16bit)}"
-          f"\n\t8 bit: {len(list_8bit)}"
-        f"\n\n*** COG pansharps ***"
-          f"\nExisting cog pansharps: {len(existing_cogs)}"
-          f"\n\t16 bit: {len([x for x in existing_cogs if x.dtype == 'uint16'])}"
-          f"\n\t\t8 bit copy: {len([x for x in PshRaster.all_objects if x.cog_8bit_copy])}"
-          f"\n\t8 bit: {len([x for x in existing_cogs if x.dtype == 'uint8'])}"
-        f"\n\n*** Non-COG pansharps ***"
-          f"\nExisting non-cog pansharps: {len(existing_pshps)}"
-          f"\n\t16 bit: {len([x for x in existing_pshps if x.dtype == 'uint16'])}"
-          f"\n\t\t8 bit copy: {len([x for x in PshRaster.all_objects if x.pansharp_8bit_copy])}"
-          f"\n\t8 bit: {len([x for x in existing_pshps if x.dtype == 'uint8'])}"
+        f"\n*** Images ***"
+        f"\nProcessed tiles: {len(pansharp_glob_list)}"
+        f"\n\tPansharpened: {len(pansharp_glob_list) - len(existing_pshps)}"
+        f"\n\tAlready pansharpened: {len(existing_pshps)}"
+        f"\n\t16 bit: {len(list_16bit)}"
+        f"\n\t8 bit: {len(list_8bit)}"
+        f"\n\tMerged images: {len(pansharp_glob_list) - len(non_tiled)}"
+        f"\n\tNon tiled images: {len(non_tiled)}"
           )
 
     logging.info("Finished")
@@ -205,4 +165,4 @@ if __name__ == '__main__':
 
     log_config_path = Path('logging.conf').absolute()
 
-    main(**params['pansharp'], glob_params=params['glob'])
+    main(**params['process'], glob_params=params['glob'])
